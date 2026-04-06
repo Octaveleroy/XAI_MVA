@@ -15,6 +15,123 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+
+class OrthoAdam(torch.optim.Optimizer) : 
+    """
+    OrthoAdam optimizer, gradients are rotated in a random orthogonal basis. 
+    The orthogonal matrix Q is sampled once per parameter at the start. 
+    """
+
+    def __init__(self,
+                params,
+                lr:float = 1e-3,
+                betas:tuple[float,float] = (0.9,0.999),
+                eps:float = 1e-8,
+                weight_decay : float = 0.0
+                ):
+    
+        defaults = dict(lr=lr,betas=betas,eps=eps,weight_decay=weight_decay)
+        super.__init__(params,defaults)
+
+    @staticmethod
+    def _random_orthogonal(n:int,device,dtype) -> torch.Tensor:
+        """
+        Uniformly random orthogonal matrix via QR decomposition. 
+        """
+        A = torch.randn(n, n, device=device, dtype=dtype)
+        Q, R = torch.linalg.qr(A)
+        sign = torch.sign(torch.diag(R))
+        Q = Q * sign.unsqueeze(0) 
+        return Q
+    
+    @staticmethod
+    def _rotate(Q: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        """
+        Apply Q on g
+        """
+        if g.dim() == 1:
+            return Q @ g
+        n = g.shape[0]
+        return (Q @ g.view(n, -1)).view_as(g)
+ 
+    @staticmethod
+    def _unrotate(Q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        """Apply Q^T to the first dimension of s"""
+        if s.dim() == 1:
+            return Q.T @ s
+        n = s.shape[0]
+        return (Q.T @ s.view(n, -1)).view_as(s)
+    
+    @torch.no_grad()
+    def step(self, closure=None):
+        """
+        One step of Optimizer
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+ 
+        for group in self.param_groups:
+            lr        = group["lr"]
+            beta1, beta2 = group["betas"]
+            eps       = group["eps"]
+            wd        = group["weight_decay"]
+ 
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+ 
+                grad = p.grad
+ 
+                state = self.state[p]
+
+                # Create the state of p
+                if len(state) == 0:
+                    state["step"]        = 0
+                    state["exp_avg"]     = torch.zeros_like(p) 
+                    state["exp_avg_sq"]  = torch.zeros_like(p) 
+
+
+                    # Sample Q once
+                    n = p.shape[0]
+                    state["Q"] = self._random_orthogonal(n, p.device, p.dtype)
+ 
+                state["step"] += 1
+                t = state["step"]
+ 
+                Q = state["Q"]
+                exp_avg = state["exp_avg"]
+                exp_avg_sq = state["exp_avg_sq"]
+ 
+                # Rotate gradients in orthogonal basis
+                g_bar = self._rotate(Q, grad)
+
+                # Update biased moment in the basis
+                exp_avg.mul_(beta1).add_(g_bar, alpha=1.0 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(g_bar, g_bar, value=1.0 - beta2)
+ 
+                # Corrected bias estimated
+                m_hat = exp_avg  / (1.0 - beta1 ** t)
+                v_hat = exp_avg_sq / (1.0 - beta2 ** t)
+ 
+                # Adam update of s-bar in ortho basis
+                s_bar = m_hat / (v_hat.sqrt() + eps)
+ 
+                # Back to parameter basis
+                s = self._unrotate(Q, s_bar)
+ 
+                # Weight decay
+                if wd != 0.0:
+                    s = s.add(p, alpha=wd)
+ 
+                # Parameter update
+                p.add_(s, alpha=-lr)
+ 
+        return loss
+        
+
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -130,10 +247,11 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     use_softmax1: bool = False
+    use_orthoadam: bool = False 
 
 class GPT(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config : GPTConfig):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
@@ -147,11 +265,9 @@ class GPT(nn.Module):
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+    
+        self.transformer.wte.weight = self.lm_head.weight
 
         # init all weights
         self.apply(self._init_weights)
@@ -176,10 +292,13 @@ class GPT(nn.Module):
         return n_params
 
     def _init_weights(self, module):
+
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
+
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
@@ -277,10 +396,12 @@ class GPT(nn.Module):
         return model
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+
+
         # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        param_dict = {pn: p for pn, p in self.named_parameters()  if p.requires_grad}
+
+
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
@@ -289,16 +410,23 @@ class GPT(nn.Module):
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0}
         ]
+
+
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
+
+        if self.config.use_orthoadam: 
+            optimizer = OrthoAdam(optim_groups,lr=learning_rate,betas=betas)
+            print("using OrthoAdam")
+        else: 
+            # Create AdamW optimizer and use the fused version if it is available
+            fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+            use_fused = fused_available and device_type == 'cuda'
+            extra_args = dict(fused=True) if use_fused else dict()
+            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+            print(f"using fused AdamW: {use_fused}")
 
         return optimizer
 
