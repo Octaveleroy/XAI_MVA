@@ -16,120 +16,317 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 
-class OrthoAdam(torch.optim.Optimizer) : 
-    """
-    OrthoAdam optimizer, gradients are rotated in a random orthogonal basis. 
-    The orthogonal matrix Q is sampled once per parameter at the start. 
-    """
 
-    def __init__(self,
-                params,
-                lr:float = 1e-3,
-                betas:tuple[float,float] = (0.9,0.999),
-                eps:float = 1e-8,
-                weight_decay : float = 0.0
-                ):
+
+# class OrthoAdam(torch.optim.Optimizer) : 
+#     """
+#     OrthoAdam optimizer, gradients are rotated in a random orthogonal basis. 
+#     The orthogonal matrix Q is sampled once per parameter at the start. 
+#     """
+
+#     def __init__(self,
+#                 params,
+#                 lr:float = 1e-3,
+#                 betas:tuple[float,float] = (0.9,0.999),
+#                 eps:float = 1e-8,
+#                 weight_decay : float = 0.0
+#                 ):
     
-        defaults = dict(lr=lr,betas=betas,eps=eps,weight_decay=weight_decay)
-        super.__init__(params,defaults)
+#         defaults = dict(lr=lr,betas=betas,eps=eps,weight_decay=weight_decay)
+#         super.__init__(params,defaults)
 
+#     @staticmethod
+#     def _random_orthogonal(n:int,device,dtype) -> torch.Tensor:
+#         """
+#         Uniformly random orthogonal matrix via QR decomposition. 
+#         """
+#         A = torch.randn(n, n, device=device, dtype=dtype)
+#         Q, R = torch.linalg.qr(A)
+#         sign = torch.sign(torch.diag(R))
+#         Q = Q * sign.unsqueeze(0) 
+#         return Q
+    
+#     @staticmethod
+#     def _rotate(Q: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+#         """
+#         Apply Q on g
+#         """
+#         if g.dim() == 1:
+#             return Q @ g
+#         n = g.shape[0]
+#         return (Q @ g.view(n, -1)).view_as(g)
+ 
+#     @staticmethod
+#     def _unrotate(Q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+#         """Apply Q^T to the first dimension of s"""
+#         if s.dim() == 1:
+#             return Q.T @ s
+#         n = s.shape[0]
+#         return (Q.T @ s.view(n, -1)).view_as(s)
+    
+#     @torch.no_grad()
+#     def step(self, closure=None):
+#         """
+#         One step of Optimizer
+#         """
+#         loss = None
+#         if closure is not None:
+#             with torch.enable_grad():
+#                 loss = closure()
+ 
+#         for group in self.param_groups:
+#             lr        = group["lr"]
+#             beta1, beta2 = group["betas"]
+#             eps       = group["eps"]
+#             wd        = group["weight_decay"]
+ 
+#             for p in group["params"]:
+#                 if p.grad is None:
+#                     continue
+ 
+#                 grad = p.grad
+ 
+#                 state = self.state[p]
+
+#                 # Create the state of p
+#                 if len(state) == 0:
+#                     state["step"]        = 0
+#                     state["exp_avg"]     = torch.zeros_like(p) 
+#                     state["exp_avg_sq"]  = torch.zeros_like(p) 
+
+
+#                     # Sample Q once
+#                     n = p.shape[0]
+#                     state["Q"] = self._random_orthogonal(n, p.device, p.dtype)
+ 
+#                 state["step"] += 1
+#                 t = state["step"]
+ 
+#                 Q = state["Q"]
+#                 exp_avg = state["exp_avg"]
+#                 exp_avg_sq = state["exp_avg_sq"]
+ 
+#                 # Rotate gradients in orthogonal basis
+#                 g_bar = self._rotate(Q, grad)
+
+#                 # Update biased moment in the basis
+#                 exp_avg.mul_(beta1).add_(g_bar, alpha=1.0 - beta1)
+#                 exp_avg_sq.mul_(beta2).addcmul_(g_bar, g_bar, value=1.0 - beta2)
+ 
+#                 # Corrected bias estimated
+#                 m_hat = exp_avg  / (1.0 - beta1 ** t)
+#                 v_hat = exp_avg_sq / (1.0 - beta2 ** t)
+ 
+#                 # Adam update of s-bar in ortho basis
+#                 s_bar = m_hat / (v_hat.sqrt() + eps)
+ 
+#                 # Back to parameter basis
+#                 s = self._unrotate(Q, s_bar)
+ 
+#                 # Weight decay
+#                 if wd != 0.0:
+#                     s = s.add(p, alpha=wd)
+ 
+#                 # Parameter update
+#                 p.add_(s, alpha=-lr)
+ 
+#         return loss
+        
+
+
+class OrthoAdam(torch.optim.Optimizer):
+    """
+    OrthoAdam with 3 differents manner to handle it : 
+    * block : fast and Pytorch friendly 
+    * hadamard : memory friendly but slow
+    * full : Full QR decomposition can be very slow and memory expensive
+    """
+    def __init__(self,
+                 params,
+                 lr: float = 1e-3,
+                 betas: tuple[float, float] = (0.9, 0.999),
+                 eps: float = 1e-8,
+                 weight_decay: float = 0.0,
+                 transform_mode: str = "block", 
+                 block_size: int = 128):
+        
+        if transform_mode not in ["full", "block", "hadamard"]:
+            raise ValueError(f"transform_mode must be 'full', 'block' or 'hadamard'. Not : {transform_mode}")
+            
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, 
+                        transform_mode=transform_mode, block_size=block_size)
+        super().__init__(params, defaults)
+
+    
     @staticmethod
-    def _random_orthogonal(n:int,device,dtype) -> torch.Tensor:
+    def _random_orthogonal_full(n: int, device, dtype):
         """
-        Uniformly random orthogonal matrix via QR decomposition. 
+        QR decomposition to have rotation 
         """
         A = torch.randn(n, n, device=device, dtype=dtype)
         Q, R = torch.linalg.qr(A)
         sign = torch.sign(torch.diag(R))
-        Q = Q * sign.unsqueeze(0) 
-        return Q
-    
+        return Q * sign.unsqueeze(0)
+
     @staticmethod
-    def _rotate(Q: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    def _random_orthogonal_blocks(n: int, block_size: int, device, dtype):
         """
-        Apply Q on g
+        Orthogonal blocks decomposition
         """
-        if g.dim() == 1:
-            return Q @ g
-        n = g.shape[0]
-        return (Q @ g.view(n, -1)).view_as(g)
- 
+        num_blocks = n // block_size
+        rem = n % block_size
+        
+        Q_main = None
+        if num_blocks > 0:
+            # Create num_blocks random matrix of block size and QR on it. 
+            A = torch.randn(num_blocks, block_size, block_size, device=device, dtype=dtype)
+            Q, R = torch.linalg.qr(A)
+            sign = torch.sign(torch.diagonal(R, dim1=-2, dim2=-1))
+            Q_main = Q * sign.unsqueeze(-2)
+            
+        Q_rem = None
+        if rem > 0:
+            # Remaining get also a matrix
+            A_rem = torch.randn(rem, rem, device=device, dtype=dtype)
+            Q_r, R_r = torch.linalg.qr(A_rem)
+            sign_r = torch.sign(torch.diag(R_r))
+            Q_rem = Q_r * sign_r.unsqueeze(0)
+            
+        return Q_main, Q_rem
+
     @staticmethod
-    def _unrotate(Q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-        """Apply Q^T to the first dimension of s"""
-        if s.dim() == 1:
-            return Q.T @ s
-        n = s.shape[0]
-        return (Q.T @ s.view(n, -1)).view_as(s)
+    def _rotate_blocks(Q_main, Q_rem, x_flat, block_size: int, transpose: bool = False):
+        """Decomposition with rotating block"""
+        n = x_flat.shape[0]
+        num_blocks = n // block_size
+        rem = n % block_size
+        out_parts = []
+        
+        if num_blocks > 0:
+            x_main = x_flat[:num_blocks * block_size].view(num_blocks, block_size, -1)
+            Q = Q_main.mT if transpose else Q_main 
+            out_main = torch.bmm(Q, x_main).view(num_blocks * block_size, -1)
+            out_parts.append(out_main)
+            
+        if rem > 0:
+            x_rem = x_flat[num_blocks * block_size:]
+            Q = Q_rem.T if transpose else Q_rem
+            out_rem = Q @ x_rem
+            out_parts.append(out_rem)
+            
+        return torch.cat(out_parts, dim=0)
     
+
+    @staticmethod
+    def _fwht_2d(x: torch.Tensor) -> torch.Tensor:
+        """
+        Fast Walsh-Hadamard Transform on first dimension x. 
+        X shape must be a multiple of 2. 
+        """
+        P, M = x.shape
+        out = x.clone()
+        h = 1
+        while h < P:
+            out = out.view(P // (2 * h), 2, h, M)
+            even = out[:, 0, :, :].clone()
+            odd = out[:, 1, :, :].clone()
+            out[:, 0, :, :] = even + odd
+            out[:, 1, :, :] = even - odd
+            h *= 2
+        
+        return out.view(P, M) / math.sqrt(P)
+
+
+
     @torch.no_grad()
     def step(self, closure=None):
-        """
-        One step of Optimizer
-        """
+        """Step of optim"""
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
- 
+
         for group in self.param_groups:
-            lr        = group["lr"]
+            lr = group["lr"]
             beta1, beta2 = group["betas"]
-            eps       = group["eps"]
-            wd        = group["weight_decay"]
- 
+            eps = group["eps"]
+            wd = group["weight_decay"]
+            mode = group["transform_mode"]
+            block_size = group["block_size"]
+
             for p in group["params"]:
                 if p.grad is None:
                     continue
- 
+
                 grad = p.grad
- 
                 state = self.state[p]
+                
+                n = p.shape[0]
+                m = p.numel() // n 
 
-                # Create the state of p
                 if len(state) == 0:
-                    state["step"]        = 0
-                    state["exp_avg"]     = torch.zeros_like(p) 
-                    state["exp_avg_sq"]  = torch.zeros_like(p) 
+                    state["step"] = 0
+                    
+                    if mode == "hadamard":
+                        P = 2 ** math.ceil(math.log2(n))
+                        state["P"] = P
+                        state["exp_avg"] = torch.zeros(P, m, device=p.device, dtype=p.dtype)
+                        state["exp_avg_sq"] = torch.zeros(P, m, device=p.device, dtype=p.dtype)
+                    else:
+                        state["exp_avg"] = torch.zeros(n, m, device=p.device, dtype=p.dtype)
+                        state["exp_avg_sq"] = torch.zeros(n, m, device=p.device, dtype=p.dtype)
+                        
+                        if mode == "full":
+                            if n > 8192:
+                                print(f" Possible crash with size {n} !")
+                            state["Q"] = self._random_orthogonal_full(n, p.device, p.dtype)
+                        elif mode == "block":
+                            state["Q_main"], state["Q_rem"] = self._random_orthogonal_blocks(n, block_size, p.device, p.dtype)
 
-
-                    # Sample Q once
-                    n = p.shape[0]
-                    state["Q"] = self._random_orthogonal(n, p.device, p.dtype)
- 
                 state["step"] += 1
                 t = state["step"]
- 
-                Q = state["Q"]
-                exp_avg = state["exp_avg"]
-                exp_avg_sq = state["exp_avg_sq"]
- 
-                # Rotate gradients in orthogonal basis
-                g_bar = self._rotate(Q, grad)
 
-                # Update biased moment in the basis
+                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                grad_flat = grad.view(n, m)
+
+                if mode == "full":
+                    Q = state["Q"]
+                    g_bar = Q @ grad_flat
+                elif mode == "block":
+                    g_bar = self._rotate_blocks(state["Q_main"], state["Q_rem"], grad_flat, block_size, transpose=False)
+                elif mode == "hadamard":
+                    P = state["P"]
+                    if P > n:
+                        pad = torch.zeros(P - n, m, device=p.device, dtype=p.dtype)
+                        grad_padded = torch.cat([grad_flat, pad], dim=0)
+                    else:
+                        grad_padded = grad_flat
+                    g_bar = self._fwht_2d(grad_padded)
+
                 exp_avg.mul_(beta1).add_(g_bar, alpha=1.0 - beta1)
                 exp_avg_sq.mul_(beta2).addcmul_(g_bar, g_bar, value=1.0 - beta2)
- 
-                # Corrected bias estimated
-                m_hat = exp_avg  / (1.0 - beta1 ** t)
+
+                m_hat = exp_avg / (1.0 - beta1 ** t)
                 v_hat = exp_avg_sq / (1.0 - beta2 ** t)
- 
-                # Adam update of s-bar in ortho basis
                 s_bar = m_hat / (v_hat.sqrt() + eps)
- 
-                # Back to parameter basis
-                s = self._unrotate(Q, s_bar)
- 
-                # Weight decay
+
+                if mode == "full":
+                    Q = state["Q"]
+                    s = Q.T @ s_bar
+                elif mode == "block":
+                    s = self._rotate_blocks(state["Q_main"], state["Q_rem"], s_bar, block_size, transpose=True)
+                elif mode == "hadamard":
+                    s_padded = self._fwht_2d(s_bar)
+                    s = s_padded[:n, :] 
+
+                s = s.view_as(p)
+
                 if wd != 0.0:
                     s = s.add(p, alpha=wd)
- 
-                # Parameter update
+
                 p.add_(s, alpha=-lr)
- 
+
         return loss
-        
 
 
 class LayerNorm(nn.Module):
@@ -247,7 +444,9 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     use_softmax1: bool = False
-    use_orthoadam: bool = False 
+    use_orthoadam: bool = False
+    type_orthoadam:str = "block"
+
 
 class GPT(nn.Module):
 
